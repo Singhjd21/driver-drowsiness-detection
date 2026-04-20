@@ -1,0 +1,46 @@
+"""
+config.py — Driver Monitoring System Configuration
+All tunable thresholds and system parameters in one place.
+"""
+
+# ─────────────────────────────────────────────
+#  EAR  (Eye Aspect Ratio) – drowsiness
+# ─────────────────────────────────────────────
+EAR_THRESHOLD       = 0.22   # below this → eye considered closed
+EAR_CONSEC_FRAMES   = 20     # consecutive closed-eye frames → drowsy alert
+
+# ─────────────────────────────────────────────
+#  MAR  (Mouth Aspect Ratio) – yawning
+# ─────────────────────────────────────────────
+MAR_THRESHOLD       = 0.6    # above this → mouth considered open (yawn)
+MAR_CONSEC_FRAMES   = 15     # consecutive open-mouth frames → yawn alert
+
+# ─────────────────────────────────────────────
+#  Head-pose – distraction (looking away)
+# ─────────────────────────────────────────────
+HEAD_YAW_THRESHOLD   = 30    # degrees left/right before "distracted"
+HEAD_PITCH_THRESHOLD = 25    # degrees up/down before "distracted"
+HEAD_CONSEC_FRAMES   = 15    # consecutive off-road frames → head alert
+
+# ─────────────────────────────────────────────
+#  YOLO phone detection
+# ─────────────────────────────────────────────
+YOLO_MODEL_NAME     = "yolov8n.pt"   # nano model – fast on CPU
+PHONE_CLASS_ID      = 67             # COCO class 67 = "cell phone"
+PHONE_CONF_THRESHOLD = 0.45          # minimum confidence to flag phone
+PHONE_CONSEC_FRAMES  = 10            # consecutive detections → alert
+
+# ─────────────────────────────────────────────
+#  Alert / sound
+# ─────────────────────────────────────────────
+ALERT_COOLDOWN_SEC  = 3.0    # seconds between repeated beeps
+BEEP_FREQUENCY      = 1000   # Hz  (Linux / Windows beep)
+BEEP_DURATION_MS    = 500    # milliseconds
+
+# ─────────────────────────────────────────────
+#  Display
+# ─────────────────────────────────────────────
+FRAME_WIDTH         = 960
+FRAME_HEIGHT        = 540
+DISPLAY_FPS         = True
+DASHBOARD_HEIGHT    = 160    # pixel height of the HUD dashboard strip
