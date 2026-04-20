@@ -1,0 +1,62 @@
+"""
+diagnose_mediapipe.py
+Run this FIRST to find the correct import path on your system:
+    python diagnose_mediapipe.py
+"""
+import sys
+import importlib
+
+print(f"Python: {sys.version}")
+
+# ── 1. mediapipe version ──────────────────────────────────────────────────────
+try:
+    import mediapipe as mp
+    print(f"mediapipe version: {mp.__version__}")
+except ImportError:
+    print("ERROR: mediapipe is not installed — run: pip install mediapipe")
+    sys.exit(1)
+
+# ── 2. Try every known import path ───────────────────────────────────────────
+attempts = [
+    ("mediapipe.python.solutions.face_mesh",  "FaceMesh"),
+    ("mediapipe.solutions.face_mesh",          "FaceMesh"),
+    ("mediapipe.python.solutions",             None),
+    ("mediapipe.solutions",                    None),
+]
+
+print("\n── Import path probes ──────────────────────────────────────────────────")
+working = None
+for mod_path, attr in attempts:
+    try:
+        mod = importlib.import_module(mod_path)
+        if attr:
+            cls = getattr(mod, attr)
+            print(f"  ✅  {mod_path}.{attr}  →  {cls}")
+            if working is None:
+                working = f"from {mod_path} import {attr}"
+        else:
+            print(f"    import {mod_path}  →  available")
+    except Exception as e:
+        print(f"  ❌  {mod_path}: {e}")
+
+# ── 3. Walk top-level mediapipe attrs ─────────────────────────────────────────
+print("\n── Top-level mediapipe attributes ──────────────────────────────────────")
+attrs = [a for a in dir(mp) if not a.startswith("_")]
+print("  " + ", ".join(attrs))
+
+# ── 4. Check if solutions sub-package is importable at all ───────────────────
+print("\n── Checking mediapipe.python sub-package ────────────────────────────────")
+try:
+    import mediapipe.python as mppy
+    sub = [a for a in dir(mppy) if not a.startswith("_")]
+    print(f"  mediapipe.python attrs: {sub}")
+except Exception as e:
+    print(f"  ❌ mediapipe.python: {e}")
+
+# ── 5. Summary ────────────────────────────────────────────────────────────────
+print("\n── RESULT ───────────────────────────────────────────────────────────────")
+if working:
+    print(f"  Use this in main.py:\n  {working}")
+else:
+    print("  No direct path found. Run: pip install --upgrade mediapipe")
+    print("  Then run this script again.")
