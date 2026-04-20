@@ -1,0 +1,274 @@
+"""
+main.py — Driver Monitoring System
+====================================
+Uses MediaPipe Tasks API (the ONLY API in mediapipe 0.10.x builds
+that expose: Image, ImageFormat, tasks — confirmed by diagnose_mediapipe.py).
+
+Usage:
+    python main.py [--source 0] [--debug]
+"""
+
+import argparse
+import os
+import sys
+import time
+import urllib.request
+
+import cv2
+import numpy as np
+import mediapipe as mp
+
+from config import (
+    EAR_THRESHOLD, EAR_CONSEC_FRAMES,
+    MAR_THRESHOLD, MAR_CONSEC_FRAMES,
+    HEAD_YAW_THRESHOLD, HEAD_PITCH_THRESHOLD, HEAD_CONSEC_FRAMES,
+    PHONE_CONF_THRESHOLD, PHONE_CONSEC_FRAMES, PHONE_CLASS_ID,
+    YOLO_MODEL_NAME,
+    ALERT_COOLDOWN_SEC, BEEP_FREQUENCY, BEEP_DURATION_MS,
+    FRAME_WIDTH, FRAME_HEIGHT, DASHBOARD_HEIGHT,
+)
+from utils import (
+    compute_ear, compute_mar, estimate_head_pose,
+    compute_gaze, draw_eye_tracking,
+    RollingCounter, AlertManager, DriverState,
+    draw_dashboard, draw_landmarks, draw_head_axis,
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MODEL FILE  (auto-downloaded once, ~29 MB)
+# ─────────────────────────────────────────────────────────────────────────────
+MODEL_PATH = "face_landmarker.task"
+MODEL_URL  = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+)
+
+
+def _ensure_model():
+    if not os.path.exists(MODEL_PATH):
+        print(f"[INFO] Downloading face landmark model to '{MODEL_PATH}' ...")
+        print("       (one-time download ~29 MB — please wait)")
+        try:
+            urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+            print("[INFO] Download complete.")
+        except Exception as e:
+            sys.exit(
+                f"\n[ERROR] Model download failed: {e}\n"
+                f"Download manually from:\n  {MODEL_URL}\n"
+                f"Save as '{MODEL_PATH}' in the same folder as main.py\n"
+            )
+    else:
+        print(f"[INFO] Model found: {MODEL_PATH}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MEDIAPIPE TASKS — FaceLandmarker in VIDEO mode
+# ─────────────────────────────────────────────────────────────────────────────
+def _build_landmarker():
+    BaseOptions           = mp.tasks.BaseOptions
+    FaceLandmarker        = mp.tasks.vision.FaceLandmarker
+    FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+    VisionRunningMode     = mp.tasks.vision.RunningMode
+
+    options = FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=MODEL_PATH),
+        running_mode=VisionRunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=0.6,
+        min_face_presence_confidence=0.6,
+        min_tracking_confidence=0.5,
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=False,
+    )
+    lm = FaceLandmarker.create_from_options(options)
+    print("[INFO] MediaPipe FaceLandmarker (Tasks API) initialised.")
+    return lm
+
+
+def detect_landmarks(landmarker, rgb_frame, timestamp_ms):
+    """
+    Run face landmark detection.
+    Returns list of 478 NormalizedLandmark (each has .x .y .z), or None.
+    """
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+    result   = landmarker.detect_for_video(mp_image, timestamp_ms)
+    if result.face_landmarks:
+        return result.face_landmarks[0]   # list of NormalizedLandmark
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  YOLO — phone detection
+# ─────────────────────────────────────────────────────────────────────────────
+def _load_yolo(model_name):
+    try:
+        from ultralytics import YOLO
+        print(f"[INFO] Loading YOLO model: {model_name} ...")
+        model = YOLO(model_name)
+        print("[INFO] YOLO model loaded.")
+        return model
+    except ImportError:
+        print("[WARN] ultralytics not installed — phone detection disabled.")
+        return None
+    except Exception as exc:
+        print(f"[WARN] YOLO load failed ({exc}) — phone detection disabled.")
+        return None
+
+
+def detect_phone(frame, yolo_model, conf_threshold):
+    if yolo_model is None:
+        return []
+    results = yolo_model(frame, verbose=False)[0]
+    boxes = []
+    for det in results.boxes:
+        if int(det.cls[0]) == PHONE_CLASS_ID and float(det.conf[0]) >= conf_threshold:
+            x1, y1, x2, y2 = map(int, det.xyxy[0])
+            boxes.append((x1, y1, x2, y2, float(det.conf[0])))
+    return boxes
+
+
+def draw_phone_boxes(frame, boxes):
+    for x1, y1, x2, y2, conf in boxes:
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (10, 130, 255), 2)
+        label = f"Phone {conf:.0%}"
+        (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.55, 1)
+        cv2.rectangle(frame, (x1, y1-lh-8), (x1+lw+4, y1), (10, 130, 255), -1)
+        cv2.putText(frame, label, (x1+2, y1-4),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MAIN LOOP
+# ─────────────────────────────────────────────────────────────────────────────
+def run(source=0, debug=False):
+
+    _ensure_model()
+    landmarker = _build_landmarker()
+    yolo_model = _load_yolo(YOLO_MODEL_NAME)
+
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        sys.exit(f"[ERROR] Cannot open video source: {source}")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    print(f"[INFO] Camera opened ({FRAME_WIDTH}x{FRAME_HEIGHT})")
+    print("[INFO] Running — press Q or ESC to quit\n")
+
+    ear_counter   = RollingCounter(EAR_CONSEC_FRAMES)
+    mar_counter   = RollingCounter(MAR_CONSEC_FRAMES)
+    head_counter  = RollingCounter(HEAD_CONSEC_FRAMES)
+    phone_counter = RollingCounter(PHONE_CONSEC_FRAMES)
+    alert  = AlertManager(ALERT_COOLDOWN_SEC, BEEP_FREQUENCY, BEEP_DURATION_MS)
+    state  = DriverState()
+
+    fps_t0    = time.perf_counter()
+    fps_frame = 0
+    ref_ms    = int(time.perf_counter() * 1000)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.03)
+            continue
+
+        frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+        h, w  = frame.shape[:2]
+
+        # FPS
+        fps_frame += 1
+        elapsed = time.perf_counter() - fps_t0
+        if elapsed >= 0.5:
+            state.fps = fps_frame / elapsed
+            fps_frame = 0
+            fps_t0    = time.perf_counter()
+
+        # Monotonic timestamp for Tasks API
+        ts_ms = int(time.perf_counter() * 1000) - ref_ms
+
+        # ── Face analysis ─────────────────────────────────────────────────────
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        lms = detect_landmarks(landmarker, rgb, ts_ms)
+
+        if lms is not None:
+            state.ear    = compute_ear(lms, w, h)
+            state.drowsy = ear_counter.update(state.ear < EAR_THRESHOLD)
+
+            state.mar     = compute_mar(lms, w, h)
+            state.yawning = mar_counter.update(state.mar > MAR_THRESHOLD)
+
+            state.yaw, state.pitch, state.roll = estimate_head_pose(lms, w, h)
+            off_road = (abs(state.yaw) > HEAD_YAW_THRESHOLD or
+                        abs(state.pitch) > HEAD_PITCH_THRESHOLD)
+            state.head_distracted = head_counter.update(off_road)
+
+            # ── Iris gaze tracking ────────────────────────────────────────
+            (state.gaze_x, state.gaze_y,
+             l_centre, l_radius,
+             r_centre, r_radius) = compute_gaze(lms, w, h)
+
+            draw_eye_tracking(frame, lms, w, h,
+                              state.gaze_x, state.gaze_y,
+                              l_centre, l_radius,
+                              r_centre, r_radius)
+
+            if debug:
+                draw_landmarks(frame, lms, w, h)
+                draw_head_axis(frame, lms, w, h, state.yaw, state.pitch)
+        else:
+            ear_counter.reset()
+            mar_counter.reset()
+            head_counter.reset()
+            state.ear = 1.0
+            state.mar = 0.0
+            state.drowsy = False
+            state.yawning = False
+            state.head_distracted = False
+
+        # ── Phone detection ───────────────────────────────────────────────────
+        phone_boxes          = detect_phone(frame, yolo_model, PHONE_CONF_THRESHOLD)
+        state.phone_detected = phone_counter.update(len(phone_boxes) > 0)
+        draw_phone_boxes(frame, phone_boxes)
+
+        # ── Alerts ────────────────────────────────────────────────────────────
+        if state.drowsy:
+            alert.trigger("Drowsiness — eyes closed too long!")
+        elif state.yawning:
+            alert.trigger("Yawning — consider a break.")
+        elif state.phone_detected:
+            alert.trigger("Phone detected — put it down!")
+        elif state.head_distracted:
+            alert.trigger("Head turned away — eyes on road!")
+
+        # ── HUD ───────────────────────────────────────────────────────────────
+        video_h = h - DASHBOARD_HEIGHT
+        video   = frame[:video_h, :].copy()
+        if state.any_alert:
+            pulse = np.zeros_like(video, dtype=np.uint8)
+            cv2.rectangle(pulse, (0, 0), (w, video_h), (0, 0, 80), -1)
+            cv2.addWeighted(video, 0.85, pulse, 0.15, 0, video)
+        frame[:video_h, :] = video
+        draw_dashboard(frame, state, DASHBOARD_HEIGHT)
+
+        # ── Display ───────────────────────────────────────────────────────────
+        cv2.imshow("Driver Monitoring System", frame)
+        if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+            break
+
+    cap.release()
+    landmarker.close()
+    cv2.destroyAllWindows()
+    print("[INFO] Stopped.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Driver Monitoring System")
+    parser.add_argument("--source", default=0,
+                        help="Camera index or video file (default: 0)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Show landmark and head-axis overlay")
+    args = parser.parse_args()
+    try:
+        source = int(args.source)
+    except (ValueError, TypeError):
+        source = args.source
+    run(source=source, debug=args.debug)
